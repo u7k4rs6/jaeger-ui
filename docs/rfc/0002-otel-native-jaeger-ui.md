@@ -116,7 +116,8 @@ interface OtelSpan {
   // Naming & Classification
   name: string;                 // was: operationName
   kind: SpanKind;               // was: derived from tags['span.kind'] (lowercase, e.g. "server")
-                                // in OTLP-JSON wire format: "SPAN_KIND_SERVER" (strip prefix when parsing)
+                                // OTLP-JSON sends a number (for example, 2 for server);
+                                // map it to SpanKind. An omitted value is UNSPECIFIED (0).
 
   // Timing
   startTime: Microseconds;      // was: startTime
@@ -479,7 +480,7 @@ Introduce a top-level configuration flag `useOpenTelemetryTerms` (defaulting to 
 #### Milestone 3.1: Metadata Exploration (Search Page)
 **Goal**: Implement the simplest OTLP endpoints and integrate them into the Search page.
 
-> **Note**: The `/api/v3/operations` endpoint returns `span_kind` as a **lowercase** string (e.g. `"server"`, `"client"`). This is a Jaeger-specific serialization, not the OTLP-JSON proto enum name. `useSpanNames` already normalizes with `.toLowerCase()` when filtering.
+> **Note**: The `/api/v3/operations` endpoint returns `spanKind` (proto3 camelCase) as a **lowercase** string (e.g. `"server"`, `"client"`). This is a Jaeger-specific serialization, not the OTLP-JSON proto enum value. `useSpanNames` already normalizes with `.toLowerCase()` when filtering. Both `SPAN_KIND_UNSPECIFIED` (0) and `SPAN_KIND_INTERNAL` (1) are returned as `"internal"`, so this endpoint cannot authoritatively identify a span's OTLP kind.
 
 - [x] Implement `fetchServices()` and `fetchSpanNames(service)` in `JaegerClient` (`src/api/v3/client.ts`).
 - [x] Setup `QueryClient` and `QueryClientProvider` (`src/query/app-query-client.tsx`).
@@ -555,8 +556,8 @@ The new parser replaces the role of `transformTraceData` for the OTLP route. Cov
   export function parseOtlpTrace(wireData: IOtlpTraceData): IOtelTrace {
     // 1. Validate wireData (optionally with Zod)
     // 2. Map OTLP properties to IOtelTrace
-    //    - span.kind arrives as "SPAN_KIND_SERVER" (protojson enum name);
-    //      strip the "SPAN_KIND_" prefix to map to the SpanKind enum.
+    //    - span.kind arrives as a JSON number (for example, 2 for server);
+    //      map it to the SpanKind enum. A missing value is UNSPECIFIED (0).
     // 3. ENRICH: Calculate derived properties (depth, parent/child refs, etc.)
     // 4. Return enriched IOtelTrace
   }
@@ -571,7 +572,7 @@ The new parser replaces the role of `transformTraceData` for the OTLP route. Cov
 | `kind` | **JSON number** (`2` = server) | pdata writes the enum as int32 and **omits the field entirely when `0`** (`UNSPECIFIED`) |
 | `status.code` | JSON number | same enum treatment |
 
-Do not expect the protojson enum *name* (`"SPAN_KIND_SERVER"`) on this endpoint, as the sketch's comment above assumed. That form would come from gogo protojson, which is not what serialises this response. Note the contrast with `/api/v3/operations` (see Milestone 3.1), which is a Jaeger-defined message rather than OTLP and does return `span_kind` as a lower-case string — the two endpoints genuinely differ, so a shared `SpanKind` mapper needs to handle both.
+Do not expect the protojson enum *name* (`"SPAN_KIND_SERVER"`) on this endpoint. That form would come from gogo protojson, which is not what serialises this response. Note the contrast with `/api/v3/operations` (see Milestone 3.1), which is a Jaeger-defined message rather than OTLP and does return `spanKind` as a lower-case string. The two endpoints genuinely differ, so a shared `SpanKind` mapper needs to handle both. In particular, the operations response merges OTLP kinds 0 and 1 into `"internal"` and therefore cannot be used to recover a span's OTLP kind.
 
 #### 3.6.1 Wire Format Type Generation & Validation ✅
 
@@ -620,11 +621,11 @@ import { z } from 'zod';
 
 // Auto-generated Zod schema
 export const v1SpanSchema = z.object({
-  trace_id: z.string(),  // Validates string type (from corrected spec)
-  span_id: z.string(),
+  trace_id: z.string().optional(),  // OTLP IDL has no required-field annotation
+  span_id: z.string().optional(),
   parent_span_id: z.string().optional(),
-  name: z.string(),
-  start_time_unix_nano: z.string(),
+  name: z.string().optional(),
+  start_time_unix_nano: z.string().optional(),
   // ... all other fields with automatic validation
 });
 
@@ -639,6 +640,12 @@ export const schemas = {
   // ... other auto-generated schemas
 };
 ```
+
+The generated OTLP schemas reflect the IDL: `Span`, `AnyValue`, and `Status` do not declare
+an OpenAPI `required:` array. Consequently, generated OTLP `Span` fields including `trace_id`,
+`span_id`, and `name` are optional even where their descriptions say they are required. Enforce
+those requirements in a Jaeger-specific validation layer until the IDL adds
+`field_behavior = REQUIRED` annotations.
 
 ##### Handling OTEL-JSON vs. Swagger Spec Mismatch
 
