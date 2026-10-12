@@ -36,6 +36,17 @@ type Props = { span: IOtelSpan };
 // cap since neither does Markdown's block-level reparsing.
 const MARKDOWN_SIZE_LIMIT = 150_000;
 
+// Above this much text a message opens folded, so a long conversation is scannable
+// before the reader touches anything.
+//
+// This is not a smaller MARKDOWN_SIZE_LIMIT and the two must not be merged. That one
+// guards parse cost: how expensive the content is to turn into DOM, which is why it
+// applies to Markdown alone and sits far higher. This one guards screen height: how much
+// of the panel a message takes once rendered, which is why it applies in every view and
+// has to be far lower. A message can be cheap to parse and still bury the rest of the
+// conversation, and that is the case this exists for.
+export const COLLAPSE_SIZE_LIMIT = 4000;
+
 // markdown-to-jsx only wraps its output in a block element (a <div>) once it has more
 // than one top-level child; a single short sentence with no other formatting compiles
 // to one inline node, which forceWrapper (see sharedMarkdownOptions) then wraps in a
@@ -720,6 +731,35 @@ function TokenDetails({ usage }: { usage: GenAiTokenUsage }) {
   );
 }
 
+/**
+ * How much of the panel a message will take, as the text it will actually lay out.
+ *
+ * A part shown on a media view contributes nothing. Its `text` is the source verbatim, so
+ * an embedded image arrives as a data: URI thousands of characters long (see textPart and
+ * the uri case in genAiData.ts), while what renders is an <img> that
+ * img.GenAITab--media caps at max-height in index.css. Counting those bytes would fold
+ * exactly the messages that are already short on screen, and an embedded payload is
+ * rendered on sight because showing it requests nothing.
+ *
+ * What decides that is the view the part lands on, not whether it carries media at all.
+ * A remembered format of Plain text renders that same data: URI into a <pre> in full (see
+ * PartContent), and a message laying out megabytes of base64 is exactly what this limit is
+ * here to fold - so the format in play has to be part of the question.
+ *
+ * This is deliberately not message.content, which joins every part's text including the
+ * media sources this excludes.
+ */
+function messageSize(message: GenAiMessage, formatOverride: MessageFormat | null): number {
+  return message.parts.reduce((total, part) => {
+    // Asking partView rather than reading part.media directly, so the one place that
+    // decides which view a part lands on stays the one place: a part carrying media still
+    // lays its source out in full whenever the remembered format is a text view, and that
+    // precedence is partView's to own, not this function's to restate.
+    const { format } = partView(parsePart(part), formatOverride);
+    return total + (format === 'image' || format === 'audio' ? 0 : part.text.length);
+  }, 0);
+}
+
 function ConversationDetails({
   systemInstructions,
   inputMessages,
@@ -770,12 +810,25 @@ function ConversationDetails({
     return list;
   }, [systemInstructions, inputMessages, outputMessages]);
 
-  // Folded state for every message, keyed the same way the rows are. Seeded in a lazy
-  // initializer rather than an effect: an effect keyed on `messages` would refire whenever
-  // that list is rebuilt and throw away whatever the reader had folded.
-  const [collapsed, setCollapsed] = useState<Record<string, boolean>>(() =>
-    Object.fromEntries(messages.map(({ key }) => [key, false]))
+  // How each message stands before the reader touches anything: folded when it is long
+  // enough on its own to be the problem. Judging each message by its own size rather than
+  // the conversation by its length leaves a long exchange of short messages fully open,
+  // where no single message is in the way and Collapse all is the tool for it.
+  const defaultCollapsed = useMemo(
+    () =>
+      Object.fromEntries(
+        messages.map(({ key, message, attributeKey }) => [
+          key,
+          messageSize(message, overrides[attributeKey] ?? null) > COLLAPSE_SIZE_LIMIT,
+        ])
+      ),
+    [messages, overrides]
   );
+
+  // What the reader has folded since, seeded from the same map in a lazy initializer rather
+  // than an effect: an effect keyed on `messages` would refire whenever that list is
+  // rebuilt and throw away whatever they had folded.
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>(() => defaultCollapsed);
 
   // Stable, so folding one message re-renders that message alone; the key arrives with the
   // call instead of a new closure per message defeating MessageBlock's memo.
@@ -826,9 +879,9 @@ function ConversationDetails({
           onFormatChange={setFormat}
           messageNumber={i + 1}
           // A key absent from the record is a message that arrived after the record was
-          // built, which reads as expanded rather than as folded by something the reader
-          // never did.
-          isCollapsed={collapsed[key] ?? false}
+          // seeded - so it opens the way it would have opened then, rather than expanded
+          // by the omission alone however long it is.
+          isCollapsed={collapsed[key] ?? defaultCollapsed[key] ?? false}
           onCollapsedChange={handleCollapsedChange}
         />
       ))}

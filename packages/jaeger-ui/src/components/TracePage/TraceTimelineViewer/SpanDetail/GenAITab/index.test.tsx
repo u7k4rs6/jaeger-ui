@@ -5,7 +5,7 @@ import React from 'react';
 import { render, screen, fireEvent, within } from '@testing-library/react';
 import { vi } from 'vitest';
 
-import GenAITab from '.';
+import GenAITab, { COLLAPSE_SIZE_LIMIT } from '.';
 import { useMessageFormatStore } from './message-format-store';
 import type { IAttribute } from '../../../../../types/otel';
 import { makeAttributes } from '../../../../../model/attributes';
@@ -324,6 +324,12 @@ describe('GenAITab', () => {
         ])}
       />
     );
+    // Anything over MARKDOWN_SIZE_LIMIT is far over COLLAPSE_SIZE_LIMIT too, so this
+    // message opens folded and a folded message shows no format control. Expand it first:
+    // what is under test here is the oversized-Markdown prompt, not the fold. Named rather
+    // than found by its folded state, which would be ambiguous the moment this fixture
+    // grows a second message.
+    fireEvent.click(screen.getByRole('button', { name: 'Message 1 (assistant)' }));
     const select = screen.getByLabelText(/Content format/) as HTMLElement;
     chooseView(select, 'Markdown');
 
@@ -351,6 +357,12 @@ describe('GenAITab', () => {
         ])}
       />
     );
+    // Anything over MARKDOWN_SIZE_LIMIT is far over COLLAPSE_SIZE_LIMIT too, so this
+    // message opens folded and a folded message shows no format control. Expand it first:
+    // what is under test here is the oversized-Markdown prompt, not the fold. Named rather
+    // than found by its folded state, which would be ambiguous the moment this fixture
+    // grows a second message.
+    fireEvent.click(screen.getByRole('button', { name: 'Message 1 (assistant)' }));
     chooseView(screen.getByLabelText(/Content format/), 'Markdown');
 
     fireEvent.click(screen.getByRole('button', { name: 'Show text' }));
@@ -853,6 +865,140 @@ describe('GenAITab message collapsing', () => {
     expect(screen.queryByRole('button', { name: 'Collapse all messages' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Expand all messages' })).toBeNull();
     expect(screen.getAllByRole('button', { expanded: true })).toHaveLength(1);
+  });
+
+  // Sized off the exported limit rather than a literal, so the tests follow the constant
+  // if it is ever retuned instead of quietly asserting the old value.
+  const OVER_LIMIT = 'x'.repeat(COLLAPSE_SIZE_LIMIT + 1);
+  const UNDER_LIMIT = 'x'.repeat(COLLAPSE_SIZE_LIMIT - 1);
+
+  function renderMessages(contents: string[]) {
+    return render(
+      <GenAITab
+        span={makeSpan([
+          {
+            key: 'gen_ai.output.messages',
+            value: contents.map(content => ({ role: 'assistant', content })),
+          },
+        ])}
+      />
+    );
+  }
+
+  it('opens a message longer than the limit already folded', () => {
+    const { container } = renderMessages([OVER_LIMIT, 'Short enough to stay open.']);
+
+    expect(
+      container.querySelectorAll('.GenAITab--message')[0].querySelector('.GenAITab--messagePreview')
+    ).not.toBeNull();
+  });
+
+  it('leaves a message shorter than the limit open', () => {
+    const { container } = renderMessages([UNDER_LIMIT, 'Short enough to stay open.']);
+
+    expect(container.querySelectorAll('.GenAITab--messagePreview')).toHaveLength(0);
+    expect(screen.getAllByRole('button', { expanded: true })).toHaveLength(2);
+  });
+
+  it('folds only the long messages of a mixed conversation, leaving the short ones open', () => {
+    const { container } = renderMessages(['Short first.', OVER_LIMIT, 'Short third.']);
+    const messages = container.querySelectorAll('.GenAITab--message');
+
+    expect(messages[0].querySelector('.GenAITab--messagePreview')).toBeNull();
+    expect(messages[1].querySelector('.GenAITab--messagePreview')).not.toBeNull();
+    expect(messages[2].querySelector('.GenAITab--messagePreview')).toBeNull();
+  });
+
+  // The regression guard for messageSize. A data: URI is kept verbatim as the part's text,
+  // so this message is far past the limit by raw length, but what renders is an image the
+  // CSS caps and which is shown on sight. Counting those bytes would fold it.
+  it('leaves an embedded image open however long its data URI is', () => {
+    const dataUri = `data:image/png;base64,${'A'.repeat(COLLAPSE_SIZE_LIMIT)}`;
+    expect(dataUri.length).toBeGreaterThan(COLLAPSE_SIZE_LIMIT);
+
+    const { container } = renderMessages([dataUri]);
+
+    expect(container.querySelector('.GenAITab--messagePreview')).toBeNull();
+    expect(screen.getAllByRole('button', { expanded: true })).toHaveLength(1);
+  });
+
+  // The other half of that guard. What a part costs in screen height is decided by the view
+  // it lands on, not by whether it carries media at all: with Plain text remembered for this
+  // attribute the same data: URI is laid out in full in a <pre>, which is precisely the case
+  // the limit is here to fold.
+  it('folds an embedded image once a remembered Plain text view lays its URI out in full', () => {
+    useMessageFormatStore.setState({ overrides: { 'gen_ai.output.messages': 'plain' } });
+    const dataUri = `data:image/png;base64,${'A'.repeat(COLLAPSE_SIZE_LIMIT)}`;
+
+    const { container } = renderMessages([dataUri]);
+
+    expect(container.querySelector('.GenAITab--messagePreview')).not.toBeNull();
+    expect(screen.queryAllByRole('button', { expanded: true })).toHaveLength(0);
+  });
+
+  // A refetch hands the same span new attributes without remounting the tab, so a message
+  // can arrive after the folded record was seeded. It opens the way it would have opened
+  // then - folded, at this length - rather than expanded because its key is simply missing.
+  it('folds a long message that arrives after the conversation was first rendered', () => {
+    const conversation = (contents: string[]) =>
+      makeSpan([
+        {
+          key: 'gen_ai.output.messages',
+          value: contents.map(content => ({ role: 'assistant', content })),
+        },
+      ]);
+    const { container, rerender } = render(<GenAITab key="span-a" span={conversation(['Short first.'])} />);
+
+    // Same key, so nothing remounts and the record still holds only the message seeded above.
+    rerender(<GenAITab key="span-a" span={conversation(['Short first.', OVER_LIMIT])} />);
+
+    const messages = container.querySelectorAll('.GenAITab--message');
+    expect(messages[0].querySelector('.GenAITab--messagePreview')).toBeNull();
+    expect(messages[1].querySelector('.GenAITab--messagePreview')).not.toBeNull();
+  });
+
+  it('still folds everything on collapse all, including messages that opened short', () => {
+    const { container } = renderMessages(['Short first.', OVER_LIMIT]);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Collapse all messages' }));
+
+    expect(container.querySelectorAll('.GenAITab--messagePreview')).toHaveLength(2);
+    expect(screen.queryAllByRole('button', { expanded: true })).toHaveLength(0);
+  });
+
+  it('still opens everything on expand all, including messages that opened folded', () => {
+    const { container } = renderMessages(['Short first.', OVER_LIMIT]);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Expand all messages' }));
+
+    expect(container.querySelectorAll('.GenAITab--messagePreview')).toHaveLength(0);
+    expect(screen.getAllByRole('button', { expanded: true })).toHaveLength(2);
+  });
+
+  // SpanDetail keys the tab subtree by span.spanID, so selecting another span remounts
+  // this component rather than feeding it new props. The key here reproduces that remount,
+  // which is what returns the section to its auto state: the reader's folding is navigation
+  // state for one span, not a preference that follows them to the next one.
+  it('returns to the auto state on a new span rather than carrying the reader last choice over', () => {
+    const conversation = makeSpan([
+      {
+        key: 'gen_ai.output.messages',
+        value: [
+          { role: 'assistant', content: OVER_LIMIT },
+          { role: 'assistant', content: 'Short second.' },
+        ],
+      },
+    ]);
+    const { container, rerender } = render(<GenAITab key="span-a" span={conversation} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Expand all messages' }));
+    expect(container.querySelectorAll('.GenAITab--messagePreview')).toHaveLength(0);
+
+    rerender(<GenAITab key="span-b" span={conversation} />);
+
+    const messages = container.querySelectorAll('.GenAITab--message');
+    expect(messages[0].querySelector('.GenAITab--messagePreview')).not.toBeNull();
+    expect(messages[1].querySelector('.GenAITab--messagePreview')).toBeNull();
   });
 });
 
